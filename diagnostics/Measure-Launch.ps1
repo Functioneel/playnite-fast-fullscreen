@@ -6,6 +6,11 @@
 
 param([string]$Label = "")
 
+if (Get-Process -Name 'Playnite*' -ErrorAction SilentlyContinue) {
+    Write-Error 'Playnite is already running. Close it first - this script starts and stops its own instance.'
+    return
+}
+
 $log = Join-Path $env:APPDATA 'Playnite\playnite.log'
 $exe = Join-Path $env:LOCALAPPDATA 'Playnite\Playnite.FullscreenApp.exe'
 

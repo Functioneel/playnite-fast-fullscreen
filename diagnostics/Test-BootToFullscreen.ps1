@@ -3,6 +3,11 @@
 # Startup shortcut does, then measures time until a fullscreen view renders.
 param([switch]$SetStartInFullscreen)
 
+if (Get-Process -Name 'Playnite*' -ErrorAction SilentlyContinue) {
+    Write-Error 'Playnite is already running. Close it first - this script starts and stops its own instance.'
+    return
+}
+
 $cfgPath = Join-Path $env:APPDATA 'Playnite\config.json'
 if ($SetStartInFullscreen) {
     $c = Get-Content $cfgPath -Raw

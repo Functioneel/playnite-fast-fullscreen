@@ -7,6 +7,11 @@
 #      overlay can't interfere)?
 param([switch]$KeepRunning)
 
+if (Get-Process -Name 'Playnite*' -ErrorAction SilentlyContinue) {
+    Write-Error 'Playnite is already running. Close it first - this script starts and stops its own instance.'
+    return
+}
+
 Add-Type -AssemblyName System.Drawing
 Add-Type @"
 using System;

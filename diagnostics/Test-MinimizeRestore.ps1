@@ -2,6 +2,11 @@
 # Verifies option C's premise: if Playnite fullscreen is minimized instead of quit,
 # does starting the exe again restore it instantly (instead of cold starting)?
 
+if (Get-Process -Name 'Playnite*' -ErrorAction SilentlyContinue) {
+    Write-Error 'Playnite is already running. Close it first - this script starts and stops its own instance.'
+    return
+}
+
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;

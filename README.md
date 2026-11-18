@@ -198,7 +198,8 @@ If you don't want the helper touching process memory, delete the `Trim-Playnite`
 
 ## Diagnostics
 
-Read-only or self-cleaning; none of them leave Playnite running.
+Read-only or self-cleaning; none of them leave Playnite running. They refuse to start if Playnite is
+already open, so they can't disturb a live session.
 
 | Script | Purpose |
 |---|---|

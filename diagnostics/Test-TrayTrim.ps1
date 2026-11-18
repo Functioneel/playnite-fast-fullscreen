@@ -1,6 +1,11 @@
 # Test-TrayTrim.ps1
 # Restarts the tray helper with the new trim logic and verifies:
 #   visible -> hidden+trimmed -> restored, with the theme still drawing.
+
+if (Get-Process -Name 'Playnite*' -ErrorAction SilentlyContinue) {
+    Write-Error 'Playnite is already running. Close it first - this script starts and stops its own instance.'
+    return
+}
 Add-Type -AssemblyName System.Drawing
 Add-Type @"
 using System;
@@ -49,7 +54,7 @@ $exe = Join-Path $env:LOCALAPPDATA 'Playnite\Playnite.FullscreenApp.exe'
 $trayLog = Join-Path $env:TEMP 'playnite-tray.log'
 
 function Helper { Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" |
-    Where-Object { $_.CommandLine -like '*-File*PlayniteTray.ps1*' } | Select-Object -First 1 }
+    Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like '*-File*PlayniteTray.ps1*' } | Select-Object -First 1 }
 function WsSum { [math]::Round(((Get-Process -Name 'Playnite*' -ErrorAction SilentlyContinue) | Measure-Object WorkingSet64 -Sum).Sum / 1MB) }
 
 # restart helper so the new code is live
