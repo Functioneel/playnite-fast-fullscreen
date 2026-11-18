@@ -1,0 +1,8 @@
+# Windows / PowerShell
+*.log
+*.png
+*.jpg
+
+# Local run output
+*.out
+diagnostics/playnite-*.png
