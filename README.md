@@ -23,7 +23,8 @@ but the ratios hold.
 | Cold start, Playnite's default theme (floor) | 3.45 s | 3.45 s |
 | "Open Playnite" while resident | 9.2 s (cold) | **0.06 s** (restore) |
 | Resident RAM while in the tray | ~400 MB | **~27 MB** |
-| Boot to fullscreen at login | ~9.2 s | ~10.2 s (Playnite's own boot stub) |
+| At login: fullscreen UI on screen | yes, after ~9.2 s | **never** — it goes straight to the tray |
+| First "open" after login | 9.2 s (cold) | **0.06 s** (already warm) |
 
 The cold start can't go much below ~9 s: that time is Playnite instantiating the theme's XAML, not
 something a script can remove. What these changes do is make you pay it **once per login** instead of
@@ -76,6 +77,24 @@ on the taskbar. The helper:
 Relaunching the Playnite shortcut while it's resident also restores it in ~0.4 s: the second process
 exits, sends `Focus` over Playnite's IPC pipe, and the existing window comes back.
 
+#### Login behaviour: straight to the tray
+
+Playnite cannot natively start fullscreen hidden. Its *start closed to tray* option is only read by the
+desktop app, and a hidden launch (`-WindowStyle Hidden`) is overridden by WPF's own `Show()`. So the
+helper hides the window itself while Playnite is still starting:
+
+- Playnite's fullscreen window **exists ~2.3 s before it is shown**, which is the window of opportunity.
+- The helper watches for that window's `EVENT_OBJECT_SHOW` and calls `SW_HIDE` from the event callback.
+- A 150 ms poll is the fallback if the event is ever missed.
+
+The window therefore spends only ~15–35 ms with `WS_VISIBLE` set, and the screen-capture test
+(`diagnostics/Test-BootFlash.ps1`, 60 Hz sampling) never captures a single Playnite frame: WPF has not
+painted anything yet at that point, it only starts painting seconds later while the window is already
+hidden. You end up with Playnite warm in the tray, and opening it later is the ~60 ms restore rather
+than a 9 s start.
+
+Set `PLAYNITE_TRAY_TRACE=1` before the helper starts if you want it to log every show event it receives.
+
 ### 4. One boot path — `Set-PlayniteBoot.ps1`
 
 Only one thing should start Playnite at login. Two options, never both:
@@ -91,6 +110,9 @@ Only one thing should start Playnite at login. Two options, never both:
   will read OFF.
 
 Pick one, then stop touching it. Running both is what produces double launches and confusing settings.
+
+Either way, login ends in the tray: Playnite starts fullscreen and the tray helper immediately hides
+its window (see §3). If you don't run the helper, Native mode really does open fullscreen at login.
 
 ---
 
@@ -207,6 +229,13 @@ already open, so they can't disturb a live session.
 | `diagnostics/Measure-PlayniteStartup.ps1` | parses `playnite.log` and tabulates the last N launches |
 | `diagnostics/Measure-Memory.ps1` | visible → hidden → trimmed → restored, with working set and commit |
 | `diagnostics/Test-BootToFullscreen.ps1` | simulates the login path (desktop exe) and times it to first fullscreen render |
+| `diagnostics/Test-BootToTray.ps1` | simulates login with the real helper: checks the window is hidden, never left visible, and restorable via the shortcut |
+| `diagnostics/Test-BootFlash.ps1` | screen-capture proof that no Playnite frame is composited during the boot hide (60 Hz sampling, saves the captured frames) |
+| `diagnostics/Test-ManualLaunch.ps1` | checks the watcher leaves a Playnite you launch yourself well after login visible |
+| `diagnostics/Observe-WindowVisibility.ps1` | records `WS_VISIBLE` transitions of Playnite's main window with timestamps |
+| `diagnostics/Test-ShowHook.ps1` | dumps the `EVENT_OBJECT_SHOW` events the helper reacts to (class, owner, visibility) |
+| `diagnostics/Test-HiddenStart.ps1` | shows why `-WindowStyle Hidden` fails, and measures how early the window exists before it is shown |
+| `diagnostics/Test-FocusFromHidden.ps1` | proves the Playnite shortcut restores a window hidden with `SW_HIDE` |
 | `diagnostics/Test-MinimizeRestore.ps1` | proves relaunching while minimized restores instead of cold-starting |
 | `diagnostics/Test-TrayTrim.ps1` | end-to-end check of hide → trim → restore with the real helper |
 
@@ -238,6 +267,12 @@ Native mode keeps it on.
 
 **Tray icon missing after login.** Check `%TEMP%\playnite-tray.log`; start manually with
 `wscript.exe scripts\PlayniteTray.vbs`. The helper refuses to run twice (named mutex).
+
+**Playnite still opens fullscreen at login.** `%TEMP%\playnite-tray.log` should contain
+`boot watch: armed` and then `boot watch: hidden to tray`. If it says `boot watch: not needed
+(Playnite already in use)` the helper started late or after a manual launch — it deliberately won't
+hide a window you're already using. If the log has no `boot watch` lines at all, the helper isn't
+starting: check `Startup\Playnite Tray.lnk` and re-run `Install-PlayniteTray.ps1`.
 
 **Screenshots of the Playnite menu look wrong/desktop-y.** If you run Rainmeter or another
 always-on-top overlay, `CopyFromScreen` captures that instead. Use `PrintWindow` (as

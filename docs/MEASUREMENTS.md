@@ -77,6 +77,53 @@ Within noise. The cost is WPF object construction, not the D3D9 path.
 | Boot → fullscreen via Playnite's own boot stub | 10.21 s / 10.25 s | `Test-BootToFullscreen.ps1` |
 | Boot → fullscreen via direct shortcut | ~9.2 s | same script, direct exe |
 
+## Boot to tray
+
+Playnite has no native "start fullscreen hidden". Its `StartOnBootClosedToTray` setting is only read
+by the desktop app (`DesktopAppViewModel.OpenView`), and `STARTUPINFO`-hidden launches are undone by
+WPF calling `Show()` — both confirmed by inspection and by `Test-HiddenStart.ps1`.
+
+The usable fact is timing: the fullscreen HWND is created **~2.3 s before it becomes visible**.
+
+| Run | main HWND exists | first `WS_VISIBLE` | head start |
+|---|---|---|---|
+| normal launch | 6777 ms | 9112 ms | 2335 ms |
+| `-WindowStyle Hidden` launch | 6497 ms | 8728 ms | 2231 ms |
+
+So the hide does not have to race the paint; it only has to beat the first composited frame.
+
+`Test-BootToTray.ps1` (helper + desktop stub, i.e. the real login path):
+
+| Measurement | Result |
+|---|---|
+| Window hid itself with no visible UI | helper log `boot watch: hidden to tray` |
+| `WS_VISIBLE` duration seen by an independent observer | 14–35 ms |
+| Shortcut launch while hidden | restores (`visible=True`) |
+| Resident working set after boot-hide | 22 MB total |
+
+Was any of that actually *seen*? `Test-BootFlash.ps1` samples a 600×360 screen region at ~64 Hz and
+compares mean brightness:
+
+| Frame | Mean brightness |
+|---|---|
+| Desktop baseline (Rainmeter + wallpaper) | 31–35 |
+| While the window reported `WS_VISIBLE` | 33.8–36.1 |
+| Playnite shown normally (reference) | **127.3** |
+
+The captured frame during `WS_VISIBLE` shows the desktop behind the console, not Playnite — WPF's first
+paint happens seconds later, long after the hide. Contrast with a genuinely visible Playnite is ~92
+brightness points, so the measurement is not marginal.
+
+### What does not work
+
+- **DWM cloak** (`DWMWA_CLOAK = 13`) applied to the window before it is shown. This would be the ideal
+  solution (the window never composites at all), but `DwmSetWindowAttribute` fails when called from
+  another process — the cloak is restricted to the owning process. Measured: `SetCloak → False`,
+  `DWMWA_CLOAKED → 0`.
+- **`-WindowStyle Hidden`** as discussed above: the HWND is created hidden, then WPF shows it anyway.
+- **WinEvent hook on the UI thread.** Worked sometimes, missed or fired late when the WinForms message
+  loop was busy (35 ms worst case). Fixed by giving the hook its own message-pump thread.
+
 ## Memory
 
 Playnite while idle in fullscreen, before trimming: **408 MB** working set, 344 MB private.
