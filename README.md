@@ -95,6 +95,45 @@ than a 9 s start.
 
 Set `PLAYNITE_TRAY_TRACE=1` before the helper starts if you want it to log every show event it receives.
 
+#### Failsafe: Playnite wedged in shutdown
+
+Windows can start a shutdown and then suspend before applications finish exiting (seen here:
+power-off requested at 03:59:57, sleep at 04:00:12). A Playnite that was closing at that moment comes
+back as a process with **no window and a single thread**. Windows already treats it as dead —
+`taskkill /F` answers *"There is no running instance of the task"* — but it still holds Playnite's
+single-instance lock, so every launch dies with `Another process instance(s) is already running`.
+
+The helper now handles this case:
+
+- a Playnite with **no window for 20 s** is treated as stuck (a starting one has its window in ~6.5 s),
+  where before it was silently "adopted" as a hidden instance;
+- it tries to clear it: `WM_CLOSE` when a window exists, otherwise `TerminateProcess`, and then it
+  checks the **process list** — not `Process.HasExited`, which wrongly reports `true` for a process
+  stuck in termination;
+- if the stale process is gone, Playnite is restarted (at login it is hidden to the tray as usual);
+- if it survives termination, the tray icon reads **Playnite (stuck)**, a balloon tells you a reboot is
+  needed, and no doomed restart is attempted;
+- when a second Playnite briefly exists, the helper targets the one that has a window (or the newest),
+  never the corpse.
+
+The reverse case is prevented too: on shutdown/restart/logoff the helper posts `WM_CLOSE` to Playnite
+and force-stops it after 3 s, so it is never left half-exited.
+
+`Quit Playnite` also works on a hidden window now. It used to call `CloseMainWindow()`, which does
+nothing when the window is hidden (`MainWindowHandle` is 0); it posts `WM_CLOSE` to the real HWND.
+
+The same operations are available without the tray, which is also handy for scripts:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\PlayniteTray.ps1 -Action status
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\PlayniteTray.ps1 -Action show
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\PlayniteTray.ps1 -Action quit
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\PlayniteTray.ps1 -Action restart
+```
+
+`-Action quit` / `-Action show` exit with code 1 and print `Playnite is stuck in shutdown; a reboot is
+required` when the process cannot be cleared.
+
 ### 4. One boot path — `Set-PlayniteBoot.ps1`
 
 Only one thing should start Playnite at login. Two options, never both:
@@ -267,6 +306,12 @@ Native mode keeps it on.
 
 **Tray icon missing after login.** Check `%TEMP%\playnite-tray.log`; start manually with
 `wscript.exe scripts\PlayniteTray.vbs`. The helper refuses to run twice (named mutex).
+
+**Playnite won't start: `Another process instance(s) is already running`.** An old Playnite is wedged
+in shutdown and still holds the single-instance lock. The tray helper detects it (no window for 20 s)
+and tries to clear it; if `taskkill /F` says *"There is no running instance of the task"*, the process
+is stuck inside its own exit and only a reboot removes it. Check with
+`PlayniteTray.ps1 -Action status`.
 
 **Playnite still opens fullscreen at login.** `%TEMP%\playnite-tray.log` should contain
 `boot watch: armed` and then `boot watch: hidden to tray`. If it says `boot watch: not needed

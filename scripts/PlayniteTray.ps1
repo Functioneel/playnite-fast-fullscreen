@@ -1,6 +1,15 @@
 # PlayniteTray.ps1
 # Tray icon + watcher for Playnite fullscreen.
 #
+# Usage:
+#   PlayniteTray.ps1                 run the tray helper (normal use, started by the VBS)
+#   PlayniteTray.ps1 -Action status  print the current state and exit
+#   PlayniteTray.ps1 -Action show    restore Playnite (or start it) and exit
+#   PlayniteTray.ps1 -Action quit    stop Playnite (asks nicely, then forces) and exit
+#   PlayniteTray.ps1 -Action restart quit + start and exit
+# The action mode exists so the tray behaviour can be scripted and tested without
+# clicking menus.
+#
 # Playnite's fullscreen app has no tray support (only the desktop app does), and its
 # "Minimize" puts the window on the taskbar. This helper:
 #   * hides the window (SW_HIDE) when Playnite is minimized, so it leaves the taskbar,
@@ -20,7 +29,22 @@
 # (it's a resident app), but resident RAM goes ~400 MB -> ~20 MB while hidden.
 # Trimmed pages fault back in on restore in ~60 ms, so it stays instant.
 #
+# Failsafe: a Playnite that has no window at all but still runs is not "hidden in the
+# tray", it is wedged - typically because Windows started a shutdown and went to sleep
+# before Playnite finished exiting. Such a process cannot be terminated any more and it
+# holds Playnite's single-instance lock, so every new launch dies with "another instance
+# is already running". The helper detects that (no window for 20 s), tries to clear it,
+# restarts Playnite, and tells you to reboot if the process refuses to die.
+#
+# The reverse case is prevented too: on session end the helper asks Playnite to close
+# (WM_CLOSE) and forces it after 3 s, so it is never left half-exited.
+#
 # Log: %TEMP%\playnite-tray.log
+
+param(
+    [ValidateSet('run', 'status', 'show', 'quit', 'restart')]
+    [string]$Action = 'run'
+)
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -37,6 +61,7 @@ public class PTrayNative {
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
     [DllImport("user32.dll")] public static extern bool GetWindowPlacement(IntPtr h, ref WINDOWPLACEMENT p);
+    [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
 
     [DllImport("psapi.dll")] public static extern bool EmptyWorkingSet(IntPtr h);
     [DllImport("kernel32.dll")] public static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
@@ -184,11 +209,6 @@ public class PTrayWatch {
 
 $ErrorActionPreference = 'Stop'
 
-# One instance only
-$mutex = New-Object System.Threading.Mutex($false, 'Global\PlayniteTrayHelper')
-if (-not $mutex.WaitOne(0)) { return }
-$script:mutex = $mutex
-
 $fullscreenExe = Join-Path $env:LOCALAPPDATA 'Playnite\Playnite.FullscreenApp.exe'
 $logPath = Join-Path $env:TEMP 'playnite-tray.log'
 $script:startedAt = Get-Date
@@ -198,7 +218,24 @@ function Write-Log([string]$msg) {
 }
 
 function Get-PlayniteProcess {
-    Get-Process -Name 'Playnite.FullscreenApp' -ErrorAction SilentlyContinue | Select-Object -First 1
+    $all = @(Get-Process -Name 'Playnite.FullscreenApp' -ErrorAction SilentlyContinue)
+    if ($all.Count -eq 0) { return $null }
+    if ($all.Count -gt 1) {
+        # Prefer an instance that owns a window; otherwise the newest one (a wedged
+        # process left over from a broken shutdown has no window and must not win).
+        foreach ($proc in $all) {
+            if ([PTrayNative]::FindMainWindow([uint32]$proc.Id) -ne [IntPtr]::Zero) { return $proc }
+        }
+        return ($all | Sort-Object StartTime -Descending | Select-Object -First 1)
+    }
+    return $all[0]
+}
+
+# Process.HasExited is true for a process that is stuck inside its own exit, even though
+# the process object still exists and keeps blocking new launches. Only the process list
+# tells the truth.
+function Test-PlayniteExists([int]$ProcessId) {
+    return [bool](Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)
 }
 
 function Get-MainWindow($proc) {
@@ -231,30 +268,102 @@ function Set-Hidden {
     $script:pendingTrimAt = (Get-Date).AddSeconds(8)
 }
 
+function Show-Balloon([string]$title, [string]$text) {
+    if (-not $script:notify) { return }
+    try {
+        $script:notify.ShowBalloonTip(10000, $title, $text, [System.Windows.Forms.ToolTipIcon]::Warning)
+    } catch { }
+}
+
+function Start-Playnite {
+    if (-not (Test-Path -LiteralPath $fullscreenExe)) {
+        Write-Log 'cannot start Playnite - exe not found'
+        return $false
+    }
+    Start-Process -FilePath $fullscreenExe -ArgumentList '--hidesplashscreen'
+    $script:noWindowSince = Get-Date
+    $script:stale = $false
+    Write-Log 'started Playnite'
+    return $true
+}
+
+# Asks Playnite to close (WM_CLOSE, which also works while it is hidden), forces it if
+# it ignores that, and reports whether the process is really gone.
+function Stop-Playnite([int]$graceSeconds = 6) {
+    $p = Get-PlayniteProcess
+    if (-not $p) { return $true }
+    $procId = $p.Id
+
+    $hwnd = Get-MainWindow $p
+    if ($hwnd -ne [IntPtr]::Zero) {
+        [PTrayNative]::PostMessage($hwnd, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+        Write-Log "asked pid $procId to close"
+    } else {
+        # No window: there is nothing to ask. TerminateProcess is the only option.
+        Write-Log "pid $procId has no window - terminating it"
+        Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+    }
+
+    $deadline = (Get-Date).AddSeconds($graceSeconds)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 250
+        if (-not (Test-PlayniteExists $procId)) { Write-Log 'Playnite exited'; return $true }
+    }
+
+    Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    if (-not (Test-PlayniteExists $procId)) { Write-Log 'Playnite force-stopped'; return $true }
+
+    # A process that survives TerminateProcess is wedged inside its own exit (Windows
+    # considers it terminated already). Nothing in user mode can clear it.
+    Write-Log "pid $procId cannot be terminated - it is stuck in shutdown, a reboot is required"
+    return $false
+}
+
 function Show-Playnite {
     # The user asked for it explicitly: stop any boot-time hiding.
     $script:bootWatch = $false
     [PTrayWatch]::WatchPid = [uint32]0
 
     $p = Get-PlayniteProcess
-    if (-not $p) {
-        if (Test-Path -LiteralPath $fullscreenExe) {
-            Start-Process -FilePath $fullscreenExe -ArgumentList '--hidesplashscreen'
-            Write-Log 'started Playnite (was not running)'
+    if (-not $p) { return (Start-Playnite) }
+
+    $hwnd = Get-MainWindow $p
+    if ($hwnd -eq [IntPtr]::Zero) {
+        # No window: either it is still starting (give it a moment) or it is wedged,
+        # in which case showing is impossible and it has to be cycled.
+        Start-Sleep -Milliseconds 1000
+        $hwnd = Get-MainWindow $p
+        if ($hwnd -eq [IntPtr]::Zero) {
+            Write-Log 'show requested on a windowless instance - cycling it'
+            if (Stop-Playnite 6) { return (Start-Playnite) }
+            Show-Balloon 'Playnite could not be stopped' 'The process is stuck in shutdown and blocks new launches. Restart Windows to clear it.'
+            return $false
         }
-        return
     }
 
     # Back to normal priority before it becomes visible, so Windows stops trimming it.
     Trim-Playnite 5
 
-    $hwnd = Get-MainWindow $p
-    if ($hwnd -eq [IntPtr]::Zero) { return }
     # SW_RESTORE also un-hides a window hidden with SW_HIDE
     [PTrayNative]::ShowWindow($hwnd, 9) | Out-Null
     [PTrayNative]::SetForegroundWindow($hwnd) | Out-Null
     $script:hidden = $false
+    $script:stale = $false
+    $script:noWindowSince = $null
     Write-Log 'restored window'
+    return $true
+}
+
+function Restart-Playnite {
+    Write-Log 'restart requested'
+    if (Stop-Playnite 6) {
+        Start-Sleep -Milliseconds 500
+        Start-Playnite | Out-Null
+        return $true
+    }
+    Show-Balloon 'Playnite could not be stopped' 'The process is stuck in shutdown and blocks new launches. Restart Windows to clear it.'
+    return $false
 }
 
 function Stop-BootWatch([string]$why) {
@@ -331,9 +440,35 @@ function Invoke-BootWatch {
 
 function Update-State {
     $p = Get-PlayniteProcess
-    if (-not $p) { $script:hidden = $false; return }
+    if (-not $p) {
+        $script:hidden = $false
+        $script:stale = $false
+        $script:noWindowSince = $null
+        return
+    }
+
     $hwnd = Get-MainWindow $p
-    if ($hwnd -eq [IntPtr]::Zero) { return }
+    if ($hwnd -eq [IntPtr]::Zero) {
+        # No top-level window at all. While Playnite is starting that is normal; any
+        # other time it means the process is wedged and holds the single-instance lock.
+        if (-not $script:noWindowSince) { $script:noWindowSince = Get-Date }
+        if (-not $script:bootWatch -and -not $script:stale) {
+            $age = ((Get-Date) - $script:noWindowSince).TotalSeconds
+            if ($age -gt 20) {
+                $script:stale = $true
+                $script:hidden = $false
+                Write-Log "Playnite has had no window for $([math]::Round($age)) s - treating it as stuck"
+                Show-Balloon 'Playnite is stuck' 'It has no window but still blocks new launches. Use "Restart Playnite" in the tray menu; if that fails, restart Windows.'
+            }
+        }
+        return
+    }
+
+    $script:noWindowSince = $null
+    if ($script:stale) {
+        $script:stale = $false
+        Write-Log 'Playnite has a window again'
+    }
 
     $visible = [PTrayNative]::IsWindowVisible($hwnd)
     $iconic = [PTrayNative]::IsIconic($hwnd)
@@ -361,6 +496,50 @@ function Update-State {
     }
 }
 
+$script:hidden = $false
+$script:hiddenSince = $null
+$script:graceUntil = (Get-Date).AddSeconds(-1)
+$script:pendingTrimAt = $null
+$script:watchPid = 0
+$script:bootWatch = $false
+$script:bootWatchUntil = (Get-Date).AddSeconds(90)
+$script:stale = $false
+$script:noWindowSince = $null
+$script:notify = $null
+
+# ---- action mode (no tray icon, no timers) ----
+if ($Action -ne 'run') {
+    $p = Get-PlayniteProcess
+    switch ($Action) {
+        'status' {
+            if (-not $p) { 'not running'; exit 0 }
+            $h = Get-MainWindow $p
+            if ($h -eq [IntPtr]::Zero) {
+                "running (pid $($p.Id)), no window - starting or stuck"; exit 0
+            }
+            "running (pid $($p.Id)), window $h, visible=$([PTrayNative]::IsWindowVisible($h)), minimized=$([PTrayNative]::IsIconic($h))"
+            exit 0
+        }
+        'show' {
+            if (Show-Playnite) { 'done'; exit 0 }
+            'Playnite is stuck in shutdown; a reboot is required'; exit 1
+        }
+        'quit' {
+            if (Stop-Playnite 6) { 'Playnite stopped'; exit 0 }
+            'Playnite is stuck in shutdown; a reboot is required'; exit 1
+        }
+        'restart' {
+            if (Restart-Playnite) { 'Playnite restarted'; exit 0 }
+            'Playnite is stuck in shutdown; a reboot is required'; exit 1
+        }
+    }
+}
+
+# ---- one instance only ----
+$mutex = New-Object System.Threading.Mutex($false, 'Global\PlayniteTrayHelper')
+if (-not $mutex.WaitOne(0)) { return }
+$script:mutex = $mutex
+
 # ---- UI ----
 $notify = New-Object System.Windows.Forms.NotifyIcon
 try {
@@ -370,18 +549,23 @@ try {
 }
 $notify.Text = 'Playnite'
 $notify.Visible = $true
+$script:notify = $notify
 
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 $itemShow = $menu.Items.Add('Show Playnite')
 $itemShow.Font = New-Object System.Drawing.Font($itemShow.Font, [System.Drawing.FontStyle]::Bold)
+$itemRestart = $menu.Items.Add('Restart Playnite')
 $itemQuit = $menu.Items.Add('Quit Playnite')
 $menu.Items.Add('-') | Out-Null
 $itemExit = $menu.Items.Add('Exit tray helper')
 
 $itemShow.add_Click({ Show-Playnite })
+$itemRestart.add_Click({ Restart-Playnite | Out-Null })
 $itemQuit.add_Click({
-    $p = Get-PlayniteProcess
-    if ($p) { $p.CloseMainWindow() | Out-Null; Write-Log 'quit requested' }
+    Write-Log 'quit requested'
+    if (-not (Stop-Playnite 6)) {
+        Show-Balloon 'Playnite could not be stopped' 'The process is stuck in shutdown and blocks new launches. Restart Windows to clear it.'
+    }
 })
 $itemExit.add_Click({
     $notify.Visible = $false
@@ -390,33 +574,82 @@ $itemExit.add_Click({
 
 $menu.add_Opening({
     $p = Get-PlayniteProcess
-    $itemShow.Text = if ($p) { 'Show Playnite' } else { 'Start Playnite' }
+    if ($script:stale) {
+        $itemShow.Text = 'Playnite is stuck'
+        $itemShow.Enabled = $false
+        $itemRestart.Text = 'Restart Playnite'
+        $notify.Text = 'Playnite (stuck)'
+    } else {
+        $itemShow.Text = if ($p) { 'Show Playnite' } else { 'Start Playnite' }
+        $itemShow.Enabled = $true
+        $notify.Text = 'Playnite'
+    }
+    $itemRestart.Enabled = [bool]$p
     $itemQuit.Enabled = [bool]$p
 })
 
 $notify.add_MouseDoubleClick({ Show-Playnite })
 $notify.ContextMenuStrip = $menu
 
-$script:hidden = $false
-$script:hiddenSince = $null
-$script:graceUntil = (Get-Date).AddSeconds(-1)
-$script:pendingTrimAt = $null
-$script:watchPid = 0
-$script:bootWatch = $false
-$script:bootWatchUntil = (Get-Date).AddSeconds(90)
+# Session ending (shutdown / restart / logoff): close Playnite now instead of leaving it
+# to Windows' shutdown timeout. A Playnite that is mid-exit when the machine suspends
+# comes back as an unkillable process that blocks every future launch.
+[Microsoft.Win32.SystemEvents]::add_SessionEnding({
+    try {
+        $p = Get-PlayniteProcess
+        if (-not $p) { return }
+        Write-Log 'session ending - closing Playnite'
+        $h = Get-MainWindow $p
+        if ($h -ne [IntPtr]::Zero) {
+            [PTrayNative]::PostMessage($h, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+        }
+        $procId = $p.Id
+        $deadline = (Get-Date).AddSeconds(3)
+        while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 200
+            if (-not (Test-PlayniteExists $procId)) { break }
+        }
+        if (-not (Test-PlayniteExists $procId)) {
+            Write-Log 'session ending - Playnite closed cleanly'
+        } else {
+            Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+            Write-Log 'session ending - Playnite force-stopped'
+        }
+    } catch { }
+})
 
 # Only treat an instance that just started (or is about to start) as the boot one.
 # A helper restarted mid-session must not hide a window you are using.
 $existing = Get-PlayniteProcess
 $script:bootWatch = $true
+$startAfterRecovery = $false
 if ($existing) {
     $age = ((Get-Date) - $existing.StartTime).TotalSeconds
-    if ($age -ge 30) {
-        # Long-running instance: never hide it now, just adopt its current state.
+    $hwnd = Get-MainWindow $existing
+
+    if ($hwnd -eq [IntPtr]::Zero) {
+        if ($age -lt 30) {
+            Write-Log 'Playnite is still starting - watching it'
+        } else {
+            # Windowless and long-running: wedged instance (holds the single-instance
+            # lock, so Playnite cannot start). Clear it and start a fresh one.
+            Write-Log "found a windowless Playnite (age $([math]::Round($age)) s) - trying to clear it"
+            $script:bootWatch = $false
+            if (Stop-Playnite 4) {
+                Write-Log 'cleared the stuck instance, starting Playnite'
+                $startAfterRecovery = $true
+                $script:bootWatch = $true
+                $script:bootWatchUntil = (Get-Date).AddSeconds(90)
+            } else {
+                $script:stale = $true
+                Show-Balloon 'Playnite is stuck' 'It has no window but still blocks new launches. Restart Windows to clear it.'
+            }
+        }
+    } else {
         $script:bootWatch = $false
-        $hwnd = Get-MainWindow $existing
-        $visible = ($hwnd -ne [IntPtr]::Zero) -and [PTrayNative]::IsWindowVisible($hwnd)
-        if (-not $visible) {
+        if ([PTrayNative]::IsWindowVisible($hwnd)) {
+            Write-Log 'adopted a visible instance'
+        } else {
             $script:hidden = $true
             $script:graceUntil = (Get-Date).AddSeconds(-1)
             Trim-Playnite 1
@@ -445,6 +678,8 @@ $watchTimer.add_Tick({ try { Invoke-BootWatch } catch { Write-Log "watch error: 
 if ($script:bootWatch) {
     $watchTimer.Start()
     Write-Log 'boot watch: armed'
+} elseif ($script:stale) {
+    Write-Log 'boot watch: not needed (Playnite is stuck - see above)'
 } else {
     Write-Log 'boot watch: not needed (Playnite already in use)'
 }
@@ -461,6 +696,8 @@ $trimTimer.add_Tick({
     } catch { }
 })
 $trimTimer.Start()
+
+if ($startAfterRecovery) { Start-Playnite | Out-Null }
 
 $traceEnv = $env:PLAYNITE_TRAY_TRACE
 if ($traceEnv) { [PTrayWatch]::TraceOn = $true; Write-Log "trace enabled (PLAYNITE_TRAY_TRACE=$traceEnv)" }

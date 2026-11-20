@@ -114,6 +114,35 @@ The captured frame during `WS_VISIBLE` shows the desktop behind the console, not
 paint happens seconds later, long after the hide. Contrast with a genuinely visible Playnite is ~92
 brightness points, so the measurement is not marginal.
 
+## A Playnite wedged by a shutdown that turned into sleep
+
+Observed on this machine, and the reason the helper has a stuck-instance failsafe:
+
+| Event | Time |
+|---|---|
+| Power-off initiated (`RuntimeBroker`, event 1074) | 03:59:57 |
+| System enters sleep (event 42, "Application API") | 04:00:12 |
+| System resumes | 04:01:08 |
+
+Playnite was closing when the machine suspended, and came back in this state:
+
+| Property | Value |
+|---|---|
+| Windows visible | none (no top-level window at all) |
+| Threads | 1 (`Wait` / `ExecutionDelay`) |
+| Handles | 2384 |
+| `Get-Process` | present |
+| `Process.HasExited` | **true** (wrong) |
+| `taskkill /F` | *"There is no running instance of the task"* |
+| `Stop-Process -Force` | no effect |
+
+It still held Playnite's single-instance lock, so every launch from 15:46 to 15:55 logged
+`PlayniteApplication:Another process instance(s) is already running, shutting down`.
+
+Lessons encoded in the helper: existence is checked with the process list, not `HasExited`; a
+windowless instance older than 20 s is "stuck", not "hidden"; and session end now closes Playnite
+(`WM_CLOSE`, forced after 3 s) instead of letting Windows' shutdown timeout leave it half-exited.
+
 ### What does not work
 
 - **DWM cloak** (`DWMWA_CLOAK = 13`) applied to the window before it is shown. This would be the ideal
